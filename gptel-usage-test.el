@@ -510,6 +510,49 @@ one-shot annotation would be wiped by the next request."
           (should-not (string-match-p "\\$" (nth 1 gptel--token-usage-strings)))
           (should (string-match-p "\\$10\\.00\\+" (nth 2 gptel--token-usage-strings))))))))
 
+(ert-deftest gptel-usage-test-header-silent-until-first-cost ()
+  "A buffer with nothing recorded shows no cost, not \"$0.00\".
+
+`gptel-usage--buffer-cost' starting at 0.0 would render as $0.00 and
+claim the session was free, which is exactly wrong in the case that
+matters: usage is being tracked but nothing has been priced yet."
+  (gptel-usage-test--with-log
+    (gptel-usage-test--with-header-mode
+      (with-temp-buffer
+        ;; gptel reports token usage, but nothing has been recorded.
+        (let ((tokens '(:input 1000 :output 500)))
+          (gptel--update-token-usage tokens tokens))
+        (should-not (string-match-p "\\$" (nth 1 gptel--token-usage-strings)))
+        (should-not (string-match-p "\\$" (nth 2 gptel--token-usage-strings)))))))
+
+(ert-deftest gptel-usage-test-header-silent-when-only-unpriced ()
+  "Requests that are all unpriced show no total, rather than \"$0.00+\"."
+  (gptel-usage-test--with-log
+    (gptel-usage-test--with-header-mode
+      (let ((gptel-usage-pricing nil))
+        (with-temp-buffer
+          (let ((tokens '(:input 1000 :output 500)))
+            (gptel-usage-test--record-in (current-buffer) tokens 'unpriced)
+            (gptel--update-token-usage tokens tokens))
+          (should gptel-usage--buffer-cost-partial)
+          (should (null gptel-usage--buffer-cost))
+          (should-not (string-match-p "\\$" (nth 2 gptel--token-usage-strings))))))))
+
+(ert-deftest gptel-usage-test-format-cost ()
+  "Cost formatting never renders a nonzero cost as free."
+  ;; Nothing recorded / unknown: no string at all.
+  (should (null (gptel-usage--format-cost nil)))
+  ;; A real zero from a priced model is legitimate.
+  (should (equal (gptel-usage--format-cost 0.0) "$0.00"))
+  ;; Below display precision: report a bound, never "$0.0000".
+  (should (equal (gptel-usage--format-cost 0.00001) "<$0.0001"))
+  (should-not (equal (gptel-usage--format-cost 0.00001) "$0.0000"))
+  ;; Sub-dollar keeps 4dp; dollars and up use 2dp.
+  (should (equal (gptel-usage--format-cost 0.2043245) "$0.2043"))
+  (should (equal (gptel-usage--format-cost 12.3456) "$12.35"))
+  ;; The partial marker rides along.
+  (should (equal (gptel-usage--format-cost 1.5 t) "$1.50+")))
+
 (ert-deftest gptel-usage-test-header-mode-off-does-not-annotate ()
   "With the display mode off, gptel's indicator is left alone."
   (gptel-usage-test--with-log
