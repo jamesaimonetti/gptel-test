@@ -138,6 +138,111 @@ TOKENS, if given, is placed on the info plist under :tokens."
   (should-not (advice-member-p #'gptel-usage--record 'gptel--handle-post-insert))
   (should-not (advice-member-p #'gptel-usage--record 'gptel--handle-error)))
 
+(defmacro gptel-usage-test--with-mode (&rest body)
+  "Evaluate BODY with `gptel-usage-mode' enabled, disabling it after."
+  (declare (indent 0))
+  `(unwind-protect (progn (gptel-usage-mode 1) ,@body)
+     (gptel-usage-mode -1)))
+
+(ert-deftest gptel-usage-test-advice-records-via-real-handler ()
+  "Calling the real advised handler records usage.
+
+This is the end-to-end check of the advice: rather than calling
+`gptel-usage--record' directly, invoke `gptel--handle-post-insert' --
+the function `gptel-usage-mode' advises, and the DONE handler in
+`gptel-send--handlers' -- with a realistic FSM and confirm a record
+lands in the log."
+  (gptel-usage-test--with-log
+    (gptel-usage-test--with-mode
+      (with-temp-buffer
+        (insert "hello")
+        (let* ((buf (current-buffer))
+               (fsm (gptel-make-fsm
+                     :table gptel-send--transitions
+                     :handlers gptel-send--handlers
+                     :info (list :backend (alist-get 'openai gptel-test-backends)
+                                 :model 'gpt-4o-mini
+                                 :buffer buf
+                                 :position (copy-marker (point-max))
+                                 :tracking-marker (copy-marker (point-max))
+                                 :tokens '(:input 7 :output 3)))))
+          (gptel--handle-post-insert fsm)
+          (let ((r (car (gptel-usage--read-log))))
+            (should r)
+            (should (equal (plist-get r :input) 7))
+            (should (equal (plist-get r :output) 3))
+            (should (equal (plist-get r :model) "gpt-4o-mini"))))))))
+
+(ert-deftest gptel-usage-test-advice-not-recorded-when-mode-off ()
+  "With the mode disabled, the real handler records nothing."
+  (gptel-usage-test--with-log
+    (with-temp-buffer
+      (insert "hello")
+      (let* ((buf (current-buffer))
+             (fsm (gptel-make-fsm
+                   :table gptel-send--transitions
+                   :handlers gptel-send--handlers
+                   :info (list :backend (alist-get 'openai gptel-test-backends)
+                               :model 'gpt-4o-mini
+                               :buffer buf
+                               :position (copy-marker (point-max))
+                               :tracking-marker (copy-marker (point-max))
+                               :tokens '(:input 7 :output 3)))))
+        (gptel--handle-post-insert fsm)
+        (should (null (gptel-usage--read-log)))))))
+
+(ert-deftest gptel-usage-test-record-is-idempotent-per-turn ()
+  "The same turn's :tokens is recorded once, even via several handlers.
+
+A request that reaches more than one advised handler (or is recorded
+twice for any other reason) must not be double-counted."
+  (gptel-usage-test--with-log
+    (let ((fsm (gptel-usage-test--fsm '(:input 10 :output 20))))
+      (gptel-usage--record fsm)
+      (gptel-usage--record fsm)
+      (gptel-usage--record fsm)
+      (should (= (length (gptel-usage--read-log)) 1)))))
+
+(ert-deftest gptel-usage-test-record-new-turn-after-dedup ()
+  "A fresh :tokens object on the same FSM is recorded again.
+
+Backends install a new :tokens plist per turn, so multi-turn requests
+and retries must not be suppressed by the idempotency guard."
+  (gptel-usage-test--with-log
+    (let ((fsm (gptel-usage-test--fsm '(:input 10 :output 20))))
+      (gptel-usage--record fsm)
+      ;; Simulate the next turn: backend installs a fresh plist.
+      (plist-put (gptel-fsm-info fsm) :tokens (list :input 1 :output 2))
+      (gptel-usage--record fsm)
+      (let ((records (gptel-usage--read-log)))
+        (should (= (length records) 2))
+        (should (equal (plist-get (nth 1 records) :input) 1))))))
+
+
+;;;; Coverage assumptions
+;;
+;; gptel-usage.el documents which request paths are tracked.  These tests
+;; pin the gptel-side facts that documentation depends on, so the claim
+;; cannot silently drift if gptel reshuffles its handler tables.
+
+(ert-deftest gptel-usage-test-coverage-gptel-send-is-tracked ()
+  "`gptel-send' FSMs run the advised handlers at DONE and ERRS."
+  (should (memq 'gptel--handle-post-insert (alist-get 'DONE gptel-send--handlers)))
+  (should (memq 'gptel--handle-error (alist-get 'ERRS gptel-send--handlers))))
+
+(ert-deftest gptel-usage-test-coverage-gptel-request-is-not-tracked ()
+  "Plain `gptel-request' FSMs do NOT run the advised handlers.
+
+`gptel-request--handlers' uses `gptel--handle-post' for DONE/ERRS, so
+bare `gptel-request' callers are not tracked.  If this test starts
+failing, gptel changed its default handlers and the COVERAGE section of
+gptel-usage.el should be revisited."
+  (require 'gptel-request)
+  (should-not (memq 'gptel--handle-post-insert
+                    (alist-get 'DONE gptel-request--handlers)))
+  (should-not (memq 'gptel--handle-error
+                    (alist-get 'ERRS gptel-request--handlers))))
+
 (ert-deftest gptel-usage-test-record-function-shape ()
   "gptel-usage--record accepts an FSM (the handler argument contract).
 gptel-send--handlers call gptel--handle-post-insert and
