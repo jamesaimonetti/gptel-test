@@ -50,9 +50,9 @@ TOKENS, if given, is placed on the info plist under :tokens."
                    20.25))))
 
 (ert-deftest gptel-usage-test-cost-missing-keys-are-zero ()
-  "Missing :input/:output/:cached in TOKENS or pricing count as zero."
+  "Absent token kinds need no rate: unused cache does not block costing."
   (let ((gptel-usage-pricing '(("gpt-4o-mini" . (:input 10.0 :output 20.0)))))
-    ;; No :cached in pricing, no :cached in tokens.
+    ;; No cache rates in pricing, and no cache tokens used.
     (should (equal (gptel-usage--cost "gpt-4o-mini" '(:input 100000 :output 200000)) 5.0))))
 
 (ert-deftest gptel-usage-test-cost-unknown-model-returns-nil ()
@@ -64,6 +64,137 @@ TOKENS, if given, is placed on the info plist under :tokens."
   "A model explicitly mapped to nil pricing counts as unknown."
   (let ((gptel-usage-pricing '(("gpt-4o-mini" . nil))))
     (should (null (gptel-usage--cost "gpt-4o-mini" '(:input 100 :output 100))))))
+
+
+;;;; Cache read/write pricing
+
+(ert-deftest gptel-usage-test-cost-cache-read-and-write ()
+  "Cache reads and writes are billed at their own rates."
+  (let ((gptel-usage-pricing
+         '(("claude" . (:input 3.0 :output 15.0
+                        :cache-read 0.3 :cache-write 3.75)))))
+    ;; :input includes the 1M cache writes, so the fresh input is 1M.
+    ;; 1M*3 + 1M*15 + 1M*0.3 + 1M*3.75 = 22.05
+    (should (< (abs (- (gptel-usage--cost
+                        "claude"
+                        '(:input 2000000 :output 1000000
+                          :cached 1000000 :cache 1000000))
+                       22.05))
+               1e-9))))
+
+(ert-deftest gptel-usage-test-cost-cache-write-not-double-counted ()
+  "Cache write tokens are billed once, not as input and write both.
+
+Anthropic and Bedrock fold cache creation tokens into :input (verified
+by `gptel-usage-test-backend-folds-cache-write-into-input'), so costing
+must subtract :cache from :input.  With a write rate far above the
+input rate, double counting is unmistakable in the total."
+  (let ((gptel-usage-pricing
+         '(("claude" . (:input 1.0 :output 0.0
+                        :cache-read 0.0 :cache-write 1000.0)))))
+    ;; Anthropic-shaped: 100 fresh + 1000 written (folded) = :input 1100.
+    ;; Correct:      100*1 + 1000*1000 = 1000100 -> $1.0001
+    ;; Double count: 1100*1 + 1000*1000 = 1001100 -> $1.0011
+    (let ((cost (gptel-usage--cost
+                 "claude" '(:input 1100 :output 0 :cached 5000 :cache 1000))))
+      (should (< (abs (- cost 1.0001)) 1e-9)))))
+
+(ert-deftest gptel-usage-test-cost-cached-alias-for-cache-read ()
+  "The legacy :cached pricing key still works as the cache read rate."
+  (let ((old '(("m" . (:input 10.0 :output 0.0 :cached 1.0))))
+        (new '(("m" . (:input 10.0 :output 0.0 :cache-read 1.0)))))
+    (let ((tokens '(:input 1000000 :output 0 :cached 1000000)))
+      (should (equal (let ((gptel-usage-pricing old))
+                       (gptel-usage--cost "m" tokens))
+                     (let ((gptel-usage-pricing new))
+                       (gptel-usage--cost "m" tokens)))))))
+
+(ert-deftest gptel-usage-test-cost-cache-read-takes-precedence ()
+  "When both keys are present, :cache-read wins over :cached."
+  (let ((gptel-usage-pricing
+         '(("m" . (:input 0.0 :output 0.0 :cache-read 2.0 :cached 99.0)))))
+    (should (< (abs (- (gptel-usage--cost "m" '(:input 0 :output 0 :cached 1000000))
+                       2.0))
+               1e-9))))
+
+(ert-deftest gptel-usage-test-cost-unknown-when-write-rate-missing ()
+  "Nonzero cache writes without a :cache-write rate make cost unknown.
+
+Billing them at zero would silently understate the cost, which is the
+same failure mode the nil-pricing convention exists to avoid."
+  (let ((gptel-usage-pricing '(("claude" . (:input 3.0 :output 15.0 :cache-read 0.3))))) 
+    (should (null (gptel-usage--cost
+                   "claude"
+                   '(:input 1100 :output 10 :cached 500 :cache 1000))))))
+
+(ert-deftest gptel-usage-test-cost-known-when-write-rate-missing-but-unused ()
+  "A missing :cache-write rate is fine when no cache writes occurred."
+  (let ((gptel-usage-pricing '(("claude" . (:input 3.0 :output 15.0 :cache-read 0.3)))))
+    (should (gptel-usage--cost
+             "claude" '(:input 1000 :output 10 :cached 500 :cache 0)))))
+
+(ert-deftest gptel-usage-test-cost-unknown-when-read-rate-missing ()
+  "Nonzero cache reads without a read rate make cost unknown."
+  (let ((gptel-usage-pricing '(("m" . (:input 3.0 :output 15.0)))))
+    (should (null (gptel-usage--cost "m" '(:input 100 :output 10 :cached 500))))))
+
+(ert-deftest gptel-usage-test-cost-never-negative-input-term ()
+  "A :cache larger than :input must not produce a cost-reducing term.
+
+Guards the subtraction against a future upstream change to the
+fold-cache-writes-into-input invariant."
+  (let ((gptel-usage-pricing
+         '(("m" . (:input 1000.0 :output 0.0 :cache-read 0.0 :cache-write 0.0))))) 
+    ;; :cache exceeds :input; the input term must clamp at 0, not go negative.
+    (should (>= (gptel-usage--cost "m" '(:input 10 :output 0 :cache 1000)) 0.0))))
+
+
+;;;; Upstream invariants that costing depends on
+
+(ert-deftest gptel-usage-test-backend-folds-cache-write-into-input ()
+  "Anthropic and Bedrock fold cache creation tokens into :input.
+
+`gptel-usage--cost' subtracts :cache from :input to avoid double
+billing.  That is only correct while gptel's backends keep folding
+cache writes into :input, so pin the behavior here: if gptel changes
+it, this fails and the costing must be revisited."
+  (require 'gptel-anthropic)
+  (require 'gptel-bedrock)
+  (let ((info (list :probe nil)))
+    (gptel--anthropic-update-tokens
+     '(:input_tokens 100 :output_tokens 7
+       :cache_creation_input_tokens 1000 :cache_read_input_tokens 5000)
+     info)
+    (let ((tokens (plist-get info :tokens)))
+      (should (equal (plist-get tokens :cache) 1000))
+      (should (equal (plist-get tokens :cached) 5000))
+      ;; The invariant: :input == fresh input + cache writes.
+      (should (equal (plist-get tokens :input) 1100))))
+  (let ((info (list :probe nil)))
+    (gptel--bedrock-update-tokens
+     '(:inputTokens 100 :outputTokens 7
+       :cacheWriteInputTokens 1000 :cacheReadInputTokens 5000)
+     info)
+    (let ((tokens (plist-get info :tokens)))
+      (should (equal (plist-get tokens :cache) 1000))
+      (should (equal (plist-get tokens :input) 1100)))))
+
+(ert-deftest gptel-usage-test-backend-without-cache-writes ()
+  "OpenAI reports no :cache and excludes cache reads from :input.
+
+The other half of the costing assumption: for backends without prompt
+cache writes, :cache is absent (so the subtraction is a no-op)."
+  (require 'gptel-openai)
+  (let ((info (list :probe nil)))
+    (gptel--openai-update-tokens
+     '(:prompt_tokens 1100 :completion_tokens 7
+       :prompt_tokens_details (:cached_tokens 500))
+     info)
+    (let ((tokens (plist-get info :tokens)))
+      (should (null (plist-get tokens :cache)))
+      (should (equal (plist-get tokens :cached) 500))
+      ;; :input excludes the cached tokens here.
+      (should (equal (plist-get tokens :input) 600)))))
 
 
 ;;;; Recording and log round-trip
@@ -84,6 +215,24 @@ TOKENS, if given, is placed on the info plist under :tokens."
           (should (equal (plist-get r :cached) 200))
           ;; 0.01 + 0.01 + 0.0002 = 0.0202 (use tolerance)
           (should (< (abs (- (plist-get r :cost) 0.0202)) 1e-9)))))))
+
+(ert-deftest gptel-usage-test-record-includes-cache-and-version ()
+  "Records carry cache write counts and the schema version."
+  (gptel-usage-test--with-log
+    (let ((gptel-usage-pricing nil))
+      (gptel-usage--record
+       (gptel-usage-test--fsm '(:input 1100 :output 5 :cached 500 :cache 1000)))
+      (let ((r (car (gptel-usage--read-log))))
+        (should (equal (plist-get r :cache) 1000))
+        (should (equal (plist-get r :cached) 500))
+        (should (equal (plist-get r :v) gptel-usage-record-version))))))
+
+(ert-deftest gptel-usage-test-record-cache-defaults-to-zero ()
+  "Backends that report no cache writes record :cache as 0, not nil."
+  (gptel-usage-test--with-log
+    (let ((gptel-usage-pricing nil))
+      (gptel-usage--record (gptel-usage-test--fsm '(:input 10 :output 5)))
+      (should (equal (plist-get (car (gptel-usage--read-log)) :cache) 0)))))
 
 (ert-deftest gptel-usage-test-record-no-tokens-no-record ()
   "FSM without :tokens (error/empty usage) appends nothing."
@@ -304,6 +453,54 @@ carries a different (larger) value."
         (let ((text (buffer-string)))
           (should (string-match-p "unknown" text))
           (should (string-match-p "no pricing configured" text)))))))
+
+(ert-deftest gptel-usage-test-report-reads-legacy-records ()
+  "Pre-v2 records (no :cache, no :v) still read and report as zero writes.
+
+Logs are append-only, so a v2 reader must tolerate records written by
+the original schema."
+  (let ((gptel-usage-log-file (make-temp-file "gptel-usage-test-")))
+    (unwind-protect
+        (progn
+          (with-temp-file gptel-usage-log-file
+            ;; Exactly the original (v1) record shape.
+            (insert (prin1-to-string
+                     '(:timestamp "2024-01-01T00:00:00+0000" :backend "OpenAI"
+                       :model "gpt-4o-mini" :input 100 :output 50 :cached 10
+                       :cost 0.5))
+                    "\n"))
+          (let ((records (gptel-usage--read-log)))
+            (should (= (length records) 1))
+            (should (null (plist-get (car records) :v))))
+          ;; Must not error on the absent :cache key.
+          (gptel-usage-report)
+          (with-current-buffer "*gptel-usage*"
+            (let ((text (buffer-string)))
+              (should (string-match-p "gpt-4o-mini" text))
+              (should (string-match-p "\\$0\\.5000" text)))))
+      (ignore-errors (delete-file gptel-usage-log-file)))))
+
+(ert-deftest gptel-usage-test-report-mixed-versions ()
+  "A log holding both v1 and v2 records aggregates cleanly."
+  (let ((gptel-usage-log-file (make-temp-file "gptel-usage-test-")))
+    (unwind-protect
+        (progn
+          (with-temp-file gptel-usage-log-file
+            (insert (prin1-to-string
+                     '(:timestamp "2024-01-01T00:00:00+0000" :backend "B"
+                       :model "m" :input 100 :output 0 :cached 0 :cost 1.0))
+                    "\n"
+                    (prin1-to-string
+                     '(:v 2 :timestamp "2024-01-02T00:00:00+0000" :backend "B"
+                       :model "m" :input 100 :output 0 :cached 0 :cache 50
+                       :cost 2.0))
+                    "\n"))
+          (gptel-usage-report)
+          (with-current-buffer "*gptel-usage*"
+            (let ((text (buffer-string)))
+              ;; 2 requests, cache writes only from the v2 record.
+              (should (string-match-p "\\$3\\.0000" text)))))
+      (ignore-errors (delete-file gptel-usage-log-file)))))
 
 (provide 'gptel-usage-test)
 ;;; gptel-usage-test.el ends here
