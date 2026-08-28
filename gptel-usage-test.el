@@ -454,6 +454,38 @@ carries a different (larger) value."
           (should (string-match-p "unknown" text))
           (should (string-match-p "no pricing configured" text)))))))
 
+(ert-deftest gptel-usage-test-report-shows-cache-columns ()
+  "Report has separate cache read and write columns, with the counts."
+  (gptel-usage-test--with-log
+    (let ((gptel-usage-pricing nil))
+      (gptel-usage--record
+       (gptel-usage-test--fsm '(:input 1100 :output 5 :cached 700 :cache 300)))
+      (gptel-usage-report)
+      (with-current-buffer "*gptel-usage*"
+        (let ((text (buffer-string)))
+          (should (string-match-p "CacheRd" text))
+          (should (string-match-p "CacheWr" text))
+          (should (string-match-p "700" text))
+          (should (string-match-p "300" text)))))))
+
+(ert-deftest gptel-usage-test-report-columns-are-disjoint ()
+  "Reported Input excludes cache writes, so token columns do not overlap.
+
+Backends that report cache writes fold them into :input.  Showing that
+raw number next to a CacheWr column would double-count the same tokens
+on screen, so the report subtracts them: for :input 1100 :cache 300 the
+Input column must read 800."
+  (gptel-usage-test--with-log
+    (let ((gptel-usage-pricing nil))
+      (gptel-usage--record
+       (gptel-usage-test--fsm '(:input 1100 :output 5 :cached 700 :cache 300)))
+      (gptel-usage-report)
+      (with-current-buffer "*gptel-usage*"
+        (goto-char (point-min))
+        ;; Row: Reqs=1, Input=800 (1100-300), Output=5, CacheRd=700, CacheWr=300
+        (should (re-search-forward
+                 "^\\S-+ +\\S-+ +1 +800 +5 +700 +300\\b" nil t))))))
+
 (ert-deftest gptel-usage-test-report-reads-legacy-records ()
   "Pre-v2 records (no :cache, no :v) still read and report as zero writes.
 
