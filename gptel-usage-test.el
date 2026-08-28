@@ -13,6 +13,9 @@
 ;; receive the FSM as their sole argument (see gptel-send--handlers in
 ;; gptel.el), so exercising `gptel-usage--record' directly with such an
 ;; FSM is equivalent to what the :after advice runs.
+;;
+;; These tests pin the behavior as committed: :tokens (this turn) is the
+;; data source, not :tokens-full (whole request, see `gptel-usage--record').
 
 (require 'ert)
 (require 'gptel)
@@ -148,6 +151,26 @@ untouched (no tokens)."
     (should (= (length (gptel-usage--read-log)) 1))
     (gptel-usage--record (gptel-usage-test--fsm))
     (should (= (length (gptel-usage--read-log)) 1))))
+
+(ert-deftest gptel-usage-test-record-tokens-not-tokens-full ()
+  "Data source is :tokens (this turn), not :tokens-full (whole request).
+
+Pins the committed `gptel-usage--record' contract: of the two keys
+gptel keeps on the FSM info plist (\"per-turn\" :tokens and cumulative
+:tokens-full), the record function reads :tokens.  So the logged
+numbers must match exactly what is in :tokens, even when :tokens-full
+carries a different (larger) value."
+  (gptel-usage-test--with-log
+    (let ((fsm (gptel-make-fsm
+                :info (list :backend (alist-get 'openai gptel-test-backends)
+                            :model 'gpt-4o-mini
+                            :tokens '(:input 10 :output 20 :cached 5)
+                            :tokens-full '(:input 1000 :output 2000 :cached 500)))))
+      (gptel-usage--record fsm)
+      (let ((r (car (gptel-usage--read-log))))
+        (should (equal (plist-get r :input) 10))
+        (should (equal (plist-get r :output) 20))
+        (should (equal (plist-get r :cached) 5))))))
 
 
 ;;;; Report rendering
