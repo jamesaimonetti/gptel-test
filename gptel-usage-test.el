@@ -429,6 +429,20 @@ carries a different (larger) value."
 
 ;;;; Report rendering
 
+(defun gptel-usage-test--report-table ()
+  "Return the report's Org table from point-min as a Lisp structure.
+Rows are lists of cell strings; horizontal rules appear as the symbol
+`hline'.  Signals if the buffer holds no table."
+  (require 'org-table)
+  (goto-char (point-min))
+  (should (re-search-forward "^|" nil t))
+  (org-table-to-lisp))
+
+(defun gptel-usage-test--report-row (model)
+  "Return the report row for MODEL as a list of cell strings, or nil."
+  (cl-find-if (lambda (row) (and (listp row) (equal (nth 1 row) model)))
+              (gptel-usage-test--report-table)))
+
 (ert-deftest gptel-usage-test-report ()
   "Report renders header, per-model group and total cost."
   (gptel-usage-test--with-log
@@ -440,8 +454,89 @@ carries a different (larger) value."
         (let ((text (buffer-string)))
           (should (string-match-p "Backend" text))
           (should (string-match-p "gpt-4o-mini" text))
-          ;; 2 requests × (10 + 20) USD
-          (should (string-match-p "\\$60\\.0000" text)))))))
+          ;; 2 requests × (10 + 20) USD.  Costs are bare numbers so the Org
+          ;; column stays numeric.
+          (should (string-match-p "\\b60\\.0000\\b" text))
+          (should-not (string-match-p "\\$" text)))))))
+
+
+;;;; Org output
+
+(ert-deftest gptel-usage-test-report-buffer-is-org-mode ()
+  "The report buffer is in `org-mode'."
+  (gptel-usage-test--with-log
+    (gptel-usage--record (gptel-usage-test--fsm '(:input 10 :output 5)))
+    (gptel-usage-report)
+    (with-current-buffer "*gptel-usage*"
+      (should (derived-mode-p 'org-mode))
+      ;; Writable, so Org table commands (sort, formulas) work.
+      (should-not buffer-read-only)
+      ;; Freshly generated content should not look like unsaved edits.
+      (should-not (buffer-modified-p)))))
+
+(ert-deftest gptel-usage-test-report-is-a-valid-org-table ()
+  "The report parses as an Org table with the expected shape."
+  (gptel-usage-test--with-log
+    (let ((gptel-usage-pricing '(("gpt-4o-mini" . (:input 10.0 :output 20.0)))))
+      (gptel-usage--record (gptel-usage-test--fsm '(:input 1000000 :output 0)))
+      (gptel-usage-report)
+      (with-current-buffer "*gptel-usage*"
+        (let* ((table (gptel-usage-test--report-table))
+               (header (car table)))
+          ;; Header, hline, one data row, hline, total row.
+          (should (equal header '("Backend" "Model" "Reqs" "Input" "Output"
+                                  "CacheRd" "CacheWr" "Cost (USD)")))
+          (should (memq 'hline table))
+          ;; Every non-rule row has the same number of cells as the header.
+          (dolist (row table)
+            (when (listp row)
+              (should (= (length row) (length header)))))
+          ;; Last row is the total.
+          (should (equal (car (car (last table))) "Total")))))))
+
+(ert-deftest gptel-usage-test-report-total-row ()
+  "The total row sums requests, tokens and known cost."
+  (gptel-usage-test--with-log
+    (let ((gptel-usage-pricing '(("gpt-4o-mini" . (:input 10.0 :output 20.0)))))
+      (gptel-usage--record (gptel-usage-test--fsm '(:input 1000000 :output 0)))
+      (gptel-usage--record (gptel-usage-test--fsm '(:input 3000000 :output 0)))
+      (gptel-usage-report)
+      (with-current-buffer "*gptel-usage*"
+        (let ((total (car (last (gptel-usage-test--report-table)))))
+          (should (equal (nth 0 total) "Total"))
+          (should (equal (nth 2 total) "2"))         ;requests
+          (should (equal (nth 3 total) "4000000"))   ;input
+          (should (equal (nth 7 total) "40.0000"))))))) ;4M * $10/M
+
+(ert-deftest gptel-usage-test-report-escapes-pipes ()
+  "A \"|\" in a backend or model name cannot break the table.
+
+An unescaped pipe splits a cell in two and shifts every later column.
+Note that `org-table-align' pads all rows to the widest one, so simply
+comparing cell counts between rows does NOT catch this -- the header
+gets padded too.  Assert the absolute column count and the position of
+a known value instead."
+  (gptel-usage-test--with-log
+    (let* ((gptel-usage-pricing nil)
+           (backend (gptel--make-openai :name "we|rd" :models '(m)))
+           (fsm (gptel-make-fsm
+                 :info (list :backend backend :model 'a\|b
+                             :tokens '(:input 10 :output 5)))))
+      (gptel-usage--record fsm)
+      (gptel-usage-report)
+      (with-current-buffer "*gptel-usage*"
+        (let* ((table (gptel-usage-test--report-table))
+               (header (car table))
+               (row (nth 2 table)))
+          ;; Two extra pipes would widen every row to 10 columns.
+          (should (= (length header) 8))
+          (should (= (length row) 8))
+          ;; Columns stay in place: Reqs is still the third cell.
+          (should (equal (nth 2 row) "1"))
+          (should (equal (nth 3 row) "10"))
+          ;; The name survives in escaped form, not as a split cell.
+          (should (string-match-p "vert" (nth 0 row)))
+          (should-not (string-match-p "|" (nth 0 row))))))))
 
 (ert-deftest gptel-usage-test-report-unknown-total ()
   "Report flags unknown-priced groups and totals only known cost."
@@ -481,10 +576,13 @@ Input column must read 800."
        (gptel-usage-test--fsm '(:input 1100 :output 5 :cached 700 :cache 300)))
       (gptel-usage-report)
       (with-current-buffer "*gptel-usage*"
-        (goto-char (point-min))
-        ;; Row: Reqs=1, Input=800 (1100-300), Output=5, CacheRd=700, CacheWr=300
-        (should (re-search-forward
-                 "^\\S-+ +\\S-+ +1 +800 +5 +700 +300\\b" nil t))))))
+        (let ((row (gptel-usage-test--report-row "gpt-4o-mini")))
+          (should row)
+          (should (equal (nth 2 row) "1"))     ;Reqs
+          (should (equal (nth 3 row) "800"))   ;Input = 1100 - 300
+          (should (equal (nth 4 row) "5"))     ;Output
+          (should (equal (nth 5 row) "700"))   ;CacheRd
+          (should (equal (nth 6 row) "300")))))))
 
 (ert-deftest gptel-usage-test-report-reads-legacy-records ()
   "Pre-v2 records (no :cache, no :v) still read and report as zero writes.
@@ -507,9 +605,10 @@ the original schema."
           ;; Must not error on the absent :cache key.
           (gptel-usage-report)
           (with-current-buffer "*gptel-usage*"
-            (let ((text (buffer-string)))
-              (should (string-match-p "gpt-4o-mini" text))
-              (should (string-match-p "\\$0\\.5000" text)))))
+            (let ((row (gptel-usage-test--report-row "gpt-4o-mini")))
+              (should row)
+              (should (equal (nth 6 row) "0"))     ;CacheWr defaults to 0
+              (should (equal (nth 7 row) "0.5000")))))
       (ignore-errors (delete-file gptel-usage-log-file)))))
 
 (ert-deftest gptel-usage-test-report-mixed-versions ()
@@ -529,9 +628,12 @@ the original schema."
                     "\n"))
           (gptel-usage-report)
           (with-current-buffer "*gptel-usage*"
-            (let ((text (buffer-string)))
-              ;; 2 requests, cache writes only from the v2 record.
-              (should (string-match-p "\\$3\\.0000" text)))))
+            (let ((row (gptel-usage-test--report-row "m")))
+              (should row)
+              (should (equal (nth 2 row) "2"))     ;both records counted
+              ;; Cache writes come only from the v2 record.
+              (should (equal (nth 6 row) "50"))
+              (should (equal (nth 7 row) "3.0000")))))
       (ignore-errors (delete-file gptel-usage-log-file)))))
 
 (provide 'gptel-usage-test)
