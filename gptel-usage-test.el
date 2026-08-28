@@ -368,6 +368,211 @@ and retries must not be suppressed by the idempotency guard."
         (should (equal (plist-get (nth 1 records) :input) 1))))))
 
 
+;;;; Per-buffer cost in the header line
+
+(defmacro gptel-usage-test--with-header-mode (&rest body)
+  "Evaluate BODY with `gptel-usage-header-line-mode' enabled."
+  (declare (indent 0))
+  `(unwind-protect (progn (gptel-usage-header-line-mode 1) ,@body)
+     (gptel-usage-header-line-mode -1)))
+
+(defun gptel-usage-test--record-in (buffer tokens &optional model)
+  "Record TOKENS as a request made in BUFFER, for MODEL."
+  (gptel-usage--record
+   (gptel-make-fsm
+    :info (list :backend (alist-get 'openai gptel-test-backends)
+                :model (or model 'gpt-4o-mini)
+                :buffer buffer
+                :tokens tokens))))
+
+(ert-deftest gptel-usage-test-buffer-cost-accumulates ()
+  "Costs accumulate per buffer: last request and running total."
+  (gptel-usage-test--with-log
+    (let ((gptel-usage-pricing '(("gpt-4o-mini" . (:input 10.0 :output 0.0)))))
+      (with-temp-buffer
+        (gptel-usage-test--record-in (current-buffer) '(:input 1000000 :output 0))
+        (should (< (abs (- gptel-usage--last-cost 10.0)) 1e-9))
+        (should (< (abs (- gptel-usage--buffer-cost 10.0)) 1e-9))
+        (gptel-usage-test--record-in (current-buffer) '(:input 2000000 :output 0))
+        ;; Last is this request only; the total covers both.
+        (should (< (abs (- gptel-usage--last-cost 20.0)) 1e-9))
+        (should (< (abs (- gptel-usage--buffer-cost 30.0)) 1e-9))
+        (should-not gptel-usage--buffer-cost-partial)))))
+
+(ert-deftest gptel-usage-test-buffer-cost-is-per-buffer ()
+  "Each buffer keeps its own total; requests do not leak across buffers."
+  (gptel-usage-test--with-log
+    (let ((gptel-usage-pricing '(("gpt-4o-mini" . (:input 10.0 :output 0.0)))))
+      (with-temp-buffer
+        (let ((a (current-buffer)))
+          (with-temp-buffer
+            (let ((b (current-buffer)))
+              (gptel-usage-test--record-in a '(:input 1000000 :output 0))
+              (gptel-usage-test--record-in b '(:input 3000000 :output 0))
+              (should (< (abs (- (buffer-local-value 'gptel-usage--buffer-cost a)
+                                 10.0))
+                         1e-9))
+              (should (< (abs (- (buffer-local-value 'gptel-usage--buffer-cost b)
+                                 30.0))
+                         1e-9)))))))))
+
+(ert-deftest gptel-usage-test-buffer-cost-unpriced-is-partial ()
+  "An unpriced request is excluded from the total and flags it partial.
+
+Counting it as zero would understate the cost, the same failure the
+nil-pricing convention exists to avoid."
+  (gptel-usage-test--with-log
+    (let ((gptel-usage-pricing '(("gpt-4o-mini" . (:input 10.0 :output 0.0)))))
+      (with-temp-buffer
+        (gptel-usage-test--record-in (current-buffer) '(:input 1000000 :output 0))
+        (gptel-usage-test--record-in (current-buffer) '(:input 5000000 :output 0)
+                                     'unpriced-model)
+        (should (null gptel-usage--last-cost))
+        ;; Total unchanged by the unpriced request, but marked partial.
+        (should (< (abs (- gptel-usage--buffer-cost 10.0)) 1e-9))
+        (should gptel-usage--buffer-cost-partial)))))
+
+(ert-deftest gptel-usage-test-record-survives-dead-buffer ()
+  "Recording still works when the request buffer is gone.
+
+Two separate guarantees: the log write does not depend on the buffer
+being live (it happens first), and updating the per-buffer totals skips
+a dead buffer rather than erroring.  `with-current-buffer' signals on a
+dead buffer, so without the liveness check the error would be caught by
+the handler in `gptel-usage--record' and reported to the user."
+  (gptel-usage-test--with-log
+    (let ((gptel-usage-pricing nil)
+          (dead (generate-new-buffer " *gptel-usage-dead*"))
+          (complaints nil))
+      (kill-buffer dead)
+      (should-not (buffer-live-p dead))
+      (cl-letf* ((orig (symbol-function 'message))
+                 ((symbol-function 'message)
+                  (lambda (fmt &rest args)
+                    (when (and (stringp fmt) (string-prefix-p "gptel-usage:" fmt))
+                      (push (apply #'format fmt args) complaints))
+                    (apply orig fmt args))))
+        (gptel-usage-test--record-in dead '(:input 10 :output 5)))
+      ;; The record is written...
+      (should (= (length (gptel-usage--read-log)) 1))
+      ;; ...and no failure was reported along the way.
+      (should-not complaints))))
+
+(ert-deftest gptel-usage-test-header-annotates-both-scopes ()
+  "The header indicator gains the last-request and buffer costs."
+  (gptel-usage-test--with-log
+    (gptel-usage-test--with-header-mode
+      (let ((gptel-usage-pricing '(("gpt-4o-mini" . (:input 10.0 :output 0.0)))))
+        (with-temp-buffer
+          (let ((tokens '(:input 1000000 :output 0)))
+            (gptel-usage-test--record-in (current-buffer) tokens)
+            (gptel--update-token-usage tokens tokens))
+          ;; (IDX REQUEST BUFFER)
+          (should (string-match-p "\\$10\\.00" (nth 1 gptel--token-usage-strings)))
+          (should (string-match-p "\\$10\\.00" (nth 2 gptel--token-usage-strings)))
+          ;; Token text is kept, not replaced.
+          (should (string-match-p "1M" (nth 1 gptel--token-usage-strings))))))))
+
+(ert-deftest gptel-usage-test-header-survives-later-requests ()
+  "Costs are re-appended after gptel rebuilds the display strings.
+
+`gptel--update-token-usage' rebuilds them from scratch each time, so a
+one-shot annotation would be wiped by the next request."
+  (gptel-usage-test--with-log
+    (gptel-usage-test--with-header-mode
+      (let ((gptel-usage-pricing '(("gpt-4o-mini" . (:input 10.0 :output 0.0)))))
+        (with-temp-buffer
+          (let ((t1 '(:input 1000000 :output 0)))
+            (gptel-usage-test--record-in (current-buffer) t1)
+            (gptel--update-token-usage t1 t1))
+          (let ((t2 '(:input 1000000 :output 0)))
+            (gptel-usage-test--record-in (current-buffer) t2)
+            (gptel--update-token-usage t2 t2))
+          ;; Second request: last is 10, buffer total is 20.
+          (should (string-match-p "\\$10\\.00" (nth 1 gptel--token-usage-strings)))
+          (should (string-match-p "\\$20\\.00" (nth 2 gptel--token-usage-strings)))
+          ;; And not doubly appended.
+          (should-not (string-match-p "\\$.*\\$" (nth 2 gptel--token-usage-strings))))))))
+
+(ert-deftest gptel-usage-test-header-marks-partial-total ()
+  "A total omitting unpriced requests is shown with a trailing \"+\"."
+  (gptel-usage-test--with-log
+    (gptel-usage-test--with-header-mode
+      (let ((gptel-usage-pricing '(("gpt-4o-mini" . (:input 10.0 :output 0.0)))))
+        (with-temp-buffer
+          (let ((tokens '(:input 1000000 :output 0)))
+            (gptel-usage-test--record-in (current-buffer) tokens)
+            (gptel--update-token-usage tokens tokens))
+          (let ((tokens '(:input 500 :output 0)))
+            (gptel-usage-test--record-in (current-buffer) tokens 'unpriced)
+            (gptel--update-token-usage tokens tokens))
+          ;; Unknown per-request cost: no cost on the request scope at all.
+          (should-not (string-match-p "\\$" (nth 1 gptel--token-usage-strings)))
+          (should (string-match-p "\\$10\\.00\\+" (nth 2 gptel--token-usage-strings))))))))
+
+(ert-deftest gptel-usage-test-header-mode-off-does-not-annotate ()
+  "With the display mode off, gptel's indicator is left alone."
+  (gptel-usage-test--with-log
+    (let ((gptel-usage-pricing '(("gpt-4o-mini" . (:input 10.0 :output 0.0)))))
+      (with-temp-buffer
+        (let ((tokens '(:input 1000000 :output 0)))
+          (gptel-usage-test--record-in (current-buffer) tokens)
+          (gptel--update-token-usage tokens tokens))
+        (should-not (string-match-p "\\$" (nth 1 gptel--token-usage-strings)))
+        (should-not (string-match-p "\\$" (nth 2 gptel--token-usage-strings)))))))
+
+(ert-deftest gptel-usage-test-header-renders-in-segment ()
+  "The cost reaches gptel's rendered header-line segment and tooltip.
+
+End-to-end check of what the user actually sees: evaluate gptel's own
+header-line info form and look for the cost in both the visible text
+and the tooltip, which lists both scopes at once."
+  (gptel-usage-test--with-log
+    (gptel-usage-test--with-header-mode
+      (let ((gptel-usage-pricing '(("gpt-4o-mini" . (:input 10.0 :output 0.0)))))
+        (with-temp-buffer
+          (setq-local gptel-mode t
+                      gptel-backend (alist-get 'openai gptel-test-backends)
+                      gptel-model 'gpt-4o-mini)
+          (let ((tokens '(:input 1000000 :output 0)))
+            (gptel-usage-test--record-in (current-buffer) tokens)
+            (gptel--update-token-usage tokens tokens))
+          ;; `gptel--header-line-info' is (:eval FORM); evaluate FORM directly,
+          ;; as batch has no window for its align-to spacer.
+          (let* ((seg (eval (cadr gptel--header-line-info) t))
+                 (text (substring-no-properties seg)))
+            (should (string-match-p "\\$10\\.00" text))
+            ;; The tooltip is built from the same strings, so it gains the
+            ;; costs for both scopes.
+            (let ((tip (get-text-property 2 'help-echo seg)))
+              (should (stringp tip))
+              (should (string-match-p "Last request:.*\\$10\\.00" tip))
+              (should (string-match-p "This buffer:.*\\$10\\.00" tip)))))))))
+
+(ert-deftest gptel-usage-test-header-mode-advice-plumbing ()
+  "Enabling and disabling the display mode adds and removes the advice."
+  (gptel-usage-header-line-mode 1)
+  (unwind-protect
+      (should (advice-member-p #'gptel-usage--annotate-header
+                               'gptel--update-token-usage))
+    (gptel-usage-header-line-mode -1))
+  (should-not (advice-member-p #'gptel-usage--annotate-header
+                               'gptel--update-token-usage)))
+
+(ert-deftest gptel-usage-test-header-strings-shape ()
+  "gptel's token display strings are (IDX REQUEST BUFFER).
+
+`gptel-usage--annotate-header' writes into slots 1 and 2 of this list.
+If gptel changes the shape, this fails instead of the annotation
+silently landing in the wrong place."
+  (with-temp-buffer
+    (gptel--update-token-usage '(:input 10 :output 5) '(:input 10 :output 5))
+    (should (= (length gptel--token-usage-strings) 3))
+    (should (integerp (car gptel--token-usage-strings)))
+    (should (stringp (nth 1 gptel--token-usage-strings)))
+    (should (stringp (nth 2 gptel--token-usage-strings)))))
+
+
 ;;;; Coverage assumptions
 ;;
 ;; gptel-usage.el documents which request paths are tracked.  These tests
