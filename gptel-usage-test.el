@@ -14,8 +14,10 @@
 ;; gptel.el), so exercising `gptel-usage--record' directly with such an
 ;; FSM is equivalent to what the :after advice runs.
 ;;
-;; These tests pin the behavior as committed: :tokens (this turn) is the
-;; data source, not :tokens-full (whole request, see `gptel-usage--record').
+;; These tests pin the behavior as committed: :tokens-full (the whole
+;; request, what the provider bills) is the data source, falling back to
+;; :tokens (this turn) when no cumulative plist is present, see
+;; `gptel-usage--record'.
 
 (require 'ert)
 (require 'gptel)
@@ -341,7 +343,7 @@ lands in the log."
         (should (null (gptel-usage--read-log)))))))
 
 (ert-deftest gptel-usage-test-record-is-idempotent-per-turn ()
-  "The same turn's :tokens is recorded once, even via several handlers.
+  "The same token plist is recorded once, even via several handlers.
 
 A request that reaches more than one advised handler (or is recorded
 twice for any other reason) must not be double-counted."
@@ -353,19 +355,20 @@ twice for any other reason) must not be double-counted."
       (should (= (length (gptel-usage--read-log)) 1)))))
 
 (ert-deftest gptel-usage-test-record-new-turn-after-dedup ()
-  "A fresh :tokens object on the same FSM is recorded again.
+  "A fresh token plist on the same FSM is recorded again.
 
-Backends install a new :tokens plist per turn, so multi-turn requests
-and retries must not be suppressed by the idempotency guard."
+Backends install a new :tokens-full plist per turn, so multi-turn
+requests and retries must not be suppressed by the idempotency guard."
   (gptel-usage-test--with-log
     (let ((fsm (gptel-usage-test--fsm '(:input 10 :output 20))))
       (gptel-usage--record fsm)
-      ;; Simulate the next turn: backend installs a fresh plist.
-      (plist-put (gptel-fsm-info fsm) :tokens (list :input 1 :output 2))
+      ;; Simulate the next turn: backend installs a fresh cumulative plist.
+      (plist-put (gptel-fsm-info fsm) :tokens-full (list :input 11 :output 22))
       (gptel-usage--record fsm)
       (let ((records (gptel-usage--read-log)))
         (should (= (length records) 2))
-        (should (equal (plist-get (nth 1 records) :input) 1))))))
+        ;; Turn 2 records the new :tokens-full (11/22), not turn 1's :tokens.
+        (should (equal (plist-get (nth 1 records) :input) 11))))))
 
 
 ;;;; Per-buffer cost in the header line
@@ -654,20 +657,38 @@ untouched (no tokens)."
     (gptel-usage--record (gptel-usage-test--fsm))
     (should (= (length (gptel-usage--read-log)) 1))))
 
-(ert-deftest gptel-usage-test-record-tokens-not-tokens-full ()
-  "Data source is :tokens (this turn), not :tokens-full (whole request).
+(ert-deftest gptel-usage-test-record-tokens-full-not-tokens ()
+  "Data source is :tokens-full (whole request), not :tokens (final turn).
 
 Pins the committed `gptel-usage--record' contract: of the two keys
 gptel keeps on the FSM info plist (\"per-turn\" :tokens and cumulative
-:tokens-full), the record function reads :tokens.  So the logged
-numbers must match exactly what is in :tokens, even when :tokens-full
-carries a different (larger) value."
+:tokens-full), the record function reads :tokens-full.  So the logged
+numbers must match exactly what is in :tokens-full, even when
+:tokens-full differs from :tokens -- the multi-turn (tool call) case
+where :tokens holds only the final turn and :tokens-full is what the
+provider bills."
   (gptel-usage-test--with-log
     (let ((fsm (gptel-make-fsm
                 :info (list :backend (alist-get 'openai gptel-test-backends)
                             :model 'gpt-4o-mini
                             :tokens '(:input 10 :output 20 :cached 5)
                             :tokens-full '(:input 1000 :output 2000 :cached 500)))))
+      (gptel-usage--record fsm)
+      (let ((r (car (gptel-usage--read-log))))
+        (should (equal (plist-get r :input) 1000))
+        (should (equal (plist-get r :output) 2000))
+        (should (equal (plist-get r :cached) 500))))))
+
+(ert-deftest gptel-usage-test-record-falls-back-to-tokens ()
+  "Without :tokens-full, :tokens (final turn) is logged instead.
+
+Synthetic and pre-v1.0 FSMs never accumulate a :tokens-full, so
+recording must degrade to :tokens rather than skip the request."
+  (gptel-usage-test--with-log
+    (let ((fsm (gptel-make-fsm
+                :info (list :backend (alist-get 'openai gptel-test-backends)
+                            :model 'gpt-4o-mini
+                            :tokens '(:input 10 :output 20 :cached 5)))))
       (gptel-usage--record fsm)
       (let ((r (car (gptel-usage--read-log))))
         (should (equal (plist-get r :input) 10))
