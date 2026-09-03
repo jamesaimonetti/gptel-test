@@ -691,6 +691,72 @@ Rows are lists of cell strings; horizontal rules appear as the symbol
   (cl-find-if (lambda (row) (and (listp row) (equal (nth 1 row) model)))
               (gptel-usage-test--report-table)))
 
+(defun gptel-usage-test--report-tables ()
+  "Return every Org table in the current report buffer, in order.
+
+Each table is a list as returned by `org-table-to-lisp'.
+Multi-table reports (week/month/year, and the day report's
+separate blocks) are handled by scanning for each table
+independently."
+  (require 'org-table)
+  (goto-char (point-min))
+  (let (tables)
+    (while (re-search-forward "^|" nil t)
+      (beginning-of-line)
+      (push (org-table-to-lisp) tables)
+      (goto-char (org-table-end)))
+    (nreverse tables)))
+
+(defun gptel-usage-test--report-heads ()
+  "Return the list of \"<<< LABEL\" headings in the current report buffer."
+  (goto-char (point-min))
+  (let (heads)
+    (while (re-search-forward "^<<<\\(.+\\)$" nil t)
+      (push (match-string-no-properties 1) heads))
+    (nreverse heads)))
+
+(defun gptel-usage-test--log-with-records (&rest ts-cost-pairs)
+  "Write TS-COST-PAIRS to the test log and return the records read back.
+
+Each pair is (TIMESTAMP COST); all use the OpenAI gpt-4o-mini backend/model."
+  (dolist (pair ts-cost-pairs)
+    (with-temp-buffer
+      (insert (prin1-to-string
+               (list :v 2 :timestamp (car pair)
+                     :backend "OpenAI" :model "gpt-4o-mini"
+                     :input 1000000 :output 0 :cached 0 :cache 0
+                     :cost (cadr pair)))
+              "\n")
+      (write-region (point-min) (point-max) gptel-usage-log-file 'append 'silent)))
+  (gptel-usage--read-log))
+
+(ert-deftest gptel-usage-test-report-grouping-day ()
+  "Day grouping renders one combined table with a Period column."
+  (gptel-usage-test--with-log
+    (let ((gptel-usage-pricing '(("gpt-4o-mini" . (:input 10.0 :output 20.0)))))
+      (gptel-usage-test--log-with-records
+       '("2026-01-01T10:00:00+0100" 20.0)
+       '("2026-01-02T10:00:00+0100" 30.0)
+       '("2026-01-02T11:00:00+0100" 40.0))
+      (gptel-usage-report 'day)
+      (with-current-buffer "*gptel-usage*"
+        (let* ((table (car (gptel-usage-test--report-tables)))
+               (header (car table))
+               (rows (cl-remove-if (lambda (r) (eq r 'hline)) table))
+               (totals (car (last rows))))
+          ;; Header gained the Period column first.
+          (should (equal (car header) "Period"))
+          (should (= (length header) 9))
+          ;; One row per (period, backend, model): day 2 has two records of
+          ;; the same model so they aggregate into one row.
+          (should (= (length rows) 4))   ; 3 data rows + Total
+          (should (member '("2026-01-01" "OpenAI" "gpt-4o-mini" "1" "1000000"
+                            "0" "0" "0" "20.0000")
+                          rows))
+          ;; Total sums all periods: 1M*10 + 7M*10 = 80 + wait: 20+30+40.
+          (should (equal (nth 8 totals) "90.0000"))
+          (should (equal (nth 3 totals) "3")))))))
+
 (ert-deftest gptel-usage-test-report ()
   "Report renders header, per-model group and total cost."
   (gptel-usage-test--with-log
@@ -883,6 +949,125 @@ the original schema."
               (should (equal (nth 6 row) "50"))
               (should (equal (nth 7 row) "3.0000")))))
       (ignore-errors (delete-file gptel-usage-log-file)))))
+
+(ert-deftest gptel-usage-test-report-grouping-week ()
+  "Week grouping uses ISO week labels, placing New Year's Eve in the
+previous year's week and January 5th in week 01."
+  (gptel-usage-test--with-log
+    (gptel-usage-test--log-with-records
+     '("2025-12-30T10:00:00+0100" 3.0)   ; W01 of 2026 (ISO)
+     '("2026-01-01T10:00:00+0100" 20.0)  ; still 2026-W01
+     '("2026-01-05T10:00:00+0100" 15.0)) ; 2026-W02
+    (gptel-usage-report 'week)
+    (with-current-buffer "*gptel-usage*"
+      ;; One table per period plus the overall total table.
+      (should (= 3 (length (gptel-usage-test--report-tables))))
+      ;; Two dates land in W01, one in W02.  2026-W01 comes after 2025-12's
+      ;; W52 under ISO reckoning but the label sorts before 2026-W02.
+      (should (equal (gptel-usage-test--report-heads)
+                     '("2026-W01" "2026-W02" "Total"))))))
+
+(ert-deftest gptel-usage-test-report-grouping-month ()
+  "Month grouping labels tables with YYYY-MM and totals per period."
+  (gptel-usage-test--with-log
+    (let ((gptel-usage-pricing '(("gpt-4o-mini" . (:input 10.0 :output 20.0)))))
+      (gptel-usage-test--log-with-records
+       '("2025-12-31T10:00:00+0100" 3.0)
+       '("2026-01-01T10:00:00+0100" 20.0)
+       '("2026-01-15T10:00:00+0100" 30.0)
+       '("2026-02-01T10:00:00+0100" 40.0))
+      (gptel-usage-report 'month)
+      (with-current-buffer "*gptel-usage*"
+        (let ((tables (gptel-usage-test--report-tables)))
+          (should (= 4 (length tables)))
+          (should (equal (gptel-usage-test--report-heads)
+                         '("2025-12" "2026-01" "2026-02" "Total")))
+          ;; The overall total sums all periods and all requests.
+          (let* ((total (car (last (car (last tables)))))
+                 (hdr (car (car (last tables)))))
+            (should (equal (nth 2 total) "4"))
+            (should (equal (nth 7 total) "93.0000"))
+            (should (equal hdr '("Backend" "Model" "Reqs" "Input" "Output"
+                                 "CacheRd" "CacheWr" "Cost (USD)")))))))))
+
+(ert-deftest gptel-usage-test-report-grouping-year ()
+  "Year grouping labels tables with YYYY, plus the overall total."
+  (gptel-usage-test--with-log
+    (gptel-usage-test--log-with-records
+     '("2025-06-01T10:00:00+0100" 1.0)
+     '("2026-06-01T10:00:00+0100" 2.0))
+    (gptel-usage-report 'year)
+    (with-current-buffer "*gptel-usage*"
+      (should (equal (gptel-usage-test--report-heads)
+                     '("2025" "2026" "Total"))))))
+
+(ert-deftest gptel-usage-test-report-grouping-default ( )
+  "`gptel-usage-report' without arguments uses the defcustom grouping."
+  (gptel-usage-test--with-log
+    (gptel-usage-test--log-with-records
+     '("2026-01-15T10:00:00+0100" 1.0)
+     '("2026-02-15T10:00:00+0100" 2.0))
+    (let ((gptel-usage-report-grouping 'month))
+      (gptel-usage-report)
+      (with-current-buffer "*gptel-usage*"
+        (should (equal (gptel-usage-test--report-heads)
+                       '("2026-01" "2026-02" "Total")))))))
+
+(ert-deftest gptel-usage-test-report-grouping-legacy-since ()
+  "A time value as the first argument still means SINCE."
+  (gptel-usage-test--with-log
+    (gptel-usage-test--log-with-records
+     '("2025-12-31T10:00:00+0100" 1.0)
+     '("2026-01-01T10:00:00+0100" 2.0)
+     '("2026-01-02T10:00:00+0100" 3.0))
+    (gptel-usage-report (date-to-time "2026-01-01"))
+    (with-current-buffer "*gptel-usage*"
+      ;; Only the two 2026 records, ungrouped (all-time table).
+      (let ((table (car (gptel-usage-test--report-tables))))
+        (should (equal (nth 2 (car (last (cl-remove-if (lambda (r) (eq r 'hline)) table))))
+                       "2"))))))
+
+(ert-deftest gptel-usage-test-report-grouping-missing-date ()
+  "Records without a parseable timestamp land in the ? period."
+  (gptel-usage-test--with-log
+    (let ((gptel-usage-pricing '(("gpt-4o-mini" . (:input 10.0 :output 20.0)))))
+      (gptel-usage-test--log-with-records
+       '("2026-01-15T10:00:00+0100" 20.0))
+      (with-temp-buffer
+        (insert (prin1-to-string
+                 '(:v 2 :backend "OpenAI" :model "gpt-4o-mini"
+                      :input 1000000 :output 0 :cached 0 :cache 0 :cost 5.0))
+                "\n")
+        (write-region (point-min) (point-max) gptel-usage-log-file 'append 'silent))
+      (gptel-usage-report 'month)
+      (with-current-buffer "*gptel-usage*"
+        (let ((tables (gptel-usage-test--report-tables)))
+          ;; 2026-01 block, ? block, then the overall total.
+          (should (= 3 (length tables)))
+          (should (equal (gptel-usage-test--report-heads)
+                         '("2026-01" "?" "Total"))))))))
+
+(ert-deftest gptel-usage-test-report-grouping-max-periods ()
+  "More periods than the cap collapse the oldest into a ... block."
+  (gptel-usage-test--with-log
+    (gptel-usage-test--log-with-records
+     '("2026-01-01T10:00:00+0100" 1.0)
+     '("2026-01-02T10:00:00+0100" 2.0)
+     '("2026-01-03T10:00:00+0100" 3.0)
+     '("2026-01-04T10:00:00+0100" 4.0))
+    (let ((gptel-usage-report-max-periods 2))
+      (gptel-usage-report 'day)
+      (with-current-buffer "*gptel-usage*"
+        ;; ... covers Jan 1-3, Jan 4 in detail, then the total row.
+        (let* ((table (car (gptel-usage-test--report-tables)))
+               (rows (cl-remove-if (lambda (r) (eq r 'hline)) table))
+               (periods (mapcar #'car (cdr rows))))  ;skip header row
+          ;; Data rows: ..., 2026-01-04, and the Total row.
+          (should (equal periods '("..." "2026-01-04" "Total")))
+          ;; Reqs column: ... aggregates 3 requests, detail row 1, total 4.
+          (should (equal (nth 3 (nth 1 rows)) "3"))
+          (should (equal (nth 3 (nth 2 rows)) "1"))
+          (should (equal (nth 3 (nth 3 rows)) "4")))))))
 
 (provide 'gptel-usage-test)
 ;;; gptel-usage-test.el ends here
