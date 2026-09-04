@@ -9,7 +9,7 @@ mkdir -p "$LOGS"
 pkill -f "[g]ptel-e2e-server.py" 2>/dev/null
 sleep 0.2
 PIDS=()
-for port in 8899 8900 8901 8902; do
+for port in 8899 8900 8901 8902 8903; do
   python3 "$SRV" "$port" > "$LOGS/server-$port.log" 2>&1 &
   PIDS+=($!)
 done
@@ -38,6 +38,8 @@ run_harness() {
 run_harness "E2E-STREAM" "$(dirname "$0")/e2e-stream.el" "E2E-STREAM-CHECKS: has-final=t no-partial=t final-once=t" 8901
 
 run_harness "E2E-URL" "$(dirname "$0")/e2e-url.el" "E2E-URL-CHECKS: final-ok=t no-error-call=t attempts-ok=t" 8899
+
+run_harness "E2E-CACHE" "$(dirname "$0")/e2e-cache.el" "E2E-CACHE-CHECKS: second-read=t first-wrote=t" 8903
 
 # Limiter: queue + resume, then abort-while-queued.  Requires all three
 # E2E-LIM-* lines to match (a single grep would only check the LAST one).

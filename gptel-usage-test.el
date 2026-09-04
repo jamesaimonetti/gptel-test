@@ -767,15 +767,15 @@ Each pair is (TIMESTAMP COST); all use the OpenAI gpt-4o-mini backend/model."
                (totals (car (last rows))))
           ;; Header gained the Period column first.
           (should (equal (car header) "Period"))
-          (should (= (length header) 9))
+          (should (= (length header) 10)) ; + Cache% column
           ;; One row per (period, backend, model): day 2 has two records of
           ;; the same model so they aggregate into one row.
           (should (= (length rows) 4))   ; 3 data rows + Total
           (should (member '("2026-01-01" "OpenAI" "gpt-4o-mini" "1" "1000000"
-                            "0" "0" "0" "20.0000")
+                            "0" "0" "0" "0.0" "20.0000")
                           rows))
           ;; Total sums all periods: 1M*10 + 7M*10 = 80 + wait: 20+30+40.
-          (should (equal (nth 8 totals) "90.0000"))
+          (should (equal (nth 9 totals) "90.0000"))
           (should (equal (nth 3 totals) "3")))))))
 
 (ert-deftest gptel-usage-test-report ()
@@ -793,6 +793,20 @@ Each pair is (TIMESTAMP COST); all use the OpenAI gpt-4o-mini backend/model."
           ;; column stays numeric.
           (should (string-match-p "\\b60\\.0000\\b" text))
           (should-not (string-match-p "\\$" text)))))))
+
+(ert-deftest gptel-usage-test-report-cache-ratio-column-opt-out ()
+  "`gptel-usage-annotate-cache-ratio' nil drops the Cache% column."
+  (gptel-usage-test--with-log
+    (let ((gptel-usage-annotate-cache-ratio nil)
+          (gptel-usage-pricing '(("gpt-4o-mini" . (:input 10.0 :output 20.0)))))
+      (gptel-usage-test--log-with-records
+       '("2026-02-15T10:00:00+0100" 3.0))
+      (gptel-usage-report)
+      (with-current-buffer "*gptel-usage*"
+        (let ((header (car (car (gptel-usage-test--report-tables)))))
+          (should (= (length header) 8))
+          (should (equal header '("Backend" "Model" "Reqs" "Input" "Output"
+                                  "CacheRd" "CacheWr" "Cost (USD)"))))))))
 
 
 ;;;; Org output
@@ -820,7 +834,7 @@ Each pair is (TIMESTAMP COST); all use the OpenAI gpt-4o-mini backend/model."
                (header (car table)))
           ;; Header, hline, one data row, hline, total row.
           (should (equal header '("Backend" "Model" "Reqs" "Input" "Output"
-                                  "CacheRd" "CacheWr" "Cost (USD)")))
+                                  "CacheRd" "CacheWr" "Cache%" "Cost (USD)")))
           (should (memq 'hline table))
           ;; Every non-rule row has the same number of cells as the header.
           (dolist (row table)
@@ -841,7 +855,7 @@ Each pair is (TIMESTAMP COST); all use the OpenAI gpt-4o-mini backend/model."
           (should (equal (nth 0 total) "Total"))
           (should (equal (nth 2 total) "2"))         ;requests
           (should (equal (nth 3 total) "4000000"))   ;input
-          (should (equal (nth 7 total) "40.0000"))))))) ;4M * $10/M
+          (should (equal (nth 8 total) "40.0000"))))))) ;4M * $10/M
 
 (ert-deftest gptel-usage-test-report-escapes-pipes ()
   "A \"|\" in a backend or model name cannot break the table.
@@ -864,8 +878,8 @@ a known value instead."
                (header (car table))
                (row (nth 2 table)))
           ;; Two extra pipes would widen every row to 10 columns.
-          (should (= (length header) 8))
-          (should (= (length row) 8))
+          (should (= (length header) 9))  ; + Cache% column
+          (should (= (length row) 9))
           ;; Columns stay in place: Reqs is still the third cell.
           (should (equal (nth 2 row) "1"))
           (should (equal (nth 3 row) "10"))
@@ -943,7 +957,7 @@ the original schema."
             (let ((row (gptel-usage-test--report-row "gpt-4o-mini")))
               (should row)
               (should (equal (nth 6 row) "0"))     ;CacheWr defaults to 0
-              (should (equal (nth 7 row) "0.5000")))))
+              (should (equal (nth 8 row) "0.5000"))))) ;Cost
       (ignore-errors (delete-file gptel-usage-log-file)))))
 
 (ert-deftest gptel-usage-test-report-mixed-versions ()
@@ -968,7 +982,7 @@ the original schema."
               (should (equal (nth 2 row) "2"))     ;both records counted
               ;; Cache writes come only from the v2 record.
               (should (equal (nth 6 row) "50"))
-              (should (equal (nth 7 row) "3.0000")))))
+              (should (equal (nth 8 row) "3.0000"))))) ;Cost
       (ignore-errors (delete-file gptel-usage-log-file)))))
 
 (ert-deftest gptel-usage-test-report-grouping-week ()
@@ -1007,9 +1021,9 @@ previous year's week and January 5th in week 01."
           (let* ((total (car (last (car (last tables)))))
                  (hdr (car (car (last tables)))))
             (should (equal (nth 2 total) "4"))
-            (should (equal (nth 7 total) "93.0000"))
+            (should (equal (nth 8 total) "93.0000"))
             (should (equal hdr '("Backend" "Model" "Reqs" "Input" "Output"
-                                 "CacheRd" "CacheWr" "Cost (USD)")))))))))
+                                 "CacheRd" "CacheWr" "Cache%" "Cost (USD)")))))))))
 
 (ert-deftest gptel-usage-test-report-grouping-year ()
   "Year grouping labels tables with YYYY, plus the overall total."
