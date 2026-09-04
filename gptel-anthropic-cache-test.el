@@ -37,11 +37,14 @@
 
 MESSAGE is a message plist as produced by `gptel--parse-list' /
 `gptel--parse-buffer'.  The breakpoint, when present, lives on the
-first content block; string content means no breakpoint (the helper
-wraps strings when it adds one)."
+first cacheable content block: block 0 for ordinary messages, or the
+text block after a leading thinking block; string content means no
+breakpoint (the helper wraps strings when it adds one)."
   (let ((content (plist-get message :content)))
     (when (vectorp content)
-      (plist-get (aref content 0) :cache_control))))
+      (cl-loop for i below (length content)
+               for block = (aref content i)
+               thereis (plist-get block :cache_control)))))
 
 ;;;; A. Breakpoint placement -- gptel--parse-list
 
@@ -186,6 +189,188 @@ tool_use, user tool_result, assistant reply, then the new prompt."
         (let ((prompts (gptel--parse-buffer gptel-anthropic-cache-test-model)))
           (should (= (length prompts) 1))
           (should (gptel-anthropic-cache-test--cache-entry (car prompts))))))))
+
+;;;; C. Re-stamp on reused payloads (agentic tool loops)
+
+(ert-deftest gptel-anthropic-cache-test-restamp-moves-breakpoint ()
+  "Re-stamping a reused payload moves the breakpoint to the new
+second-to-last message after history grows between tool rounds.
+
+Simulates an agentic loop: the FSM reuses the same DATA and appends
+assistant and tool_result messages after the initial parse, so the
+stale breakpoint from the single-message fallback would pin an
+outdated prefix.  `gptel--cache-messages' must clear it and re-stamp
+the last stable block before the incoming prompt."
+  (gptel-anthropic-cache-test--with
+    (let* ((backend gptel-anthropic-cache-test-model)
+           (gptel-cache '(message))
+           (data (list :messages
+                       (vconcat
+                        (list (list :role "user"
+                                    :content (vector
+                                              (list :type "text"
+                                                    :text "user one"))))))))
+      ;; Initial parse stamps the single message (fresh-conversation
+      ;; fallback).
+      (gptel--anthropic-cache-messages (append (plist-get data :messages) nil))
+      (should (gptel-anthropic-cache-test--cache-entry
+               (aref (plist-get data :messages) 0)))
+      ;; Agentic growth: assistant reply + tool_result, another partial
+      ;; assistant turn, then the incoming prompt.
+      (setf (plist-get data :messages)
+            (vconcat
+             (plist-get data :messages)
+             (list (list :role "assistant"
+                         :content (vector (list :type "text"
+                                                :text "assistant one")))
+                   (list :role "user"
+                         :content (vector (list :type "tool_result"
+                                                :tool_use_id "t1"
+                                                :content "tool result one")))
+                   (list :role "assistant"
+                         :content (vector (list :type "tool_use" :id "t2"
+                                                :name "probe" :input nil)))
+                   (list :role "user"
+                         :content (vector (list :type "tool_result"
+                                                :tool_use_id "t2"
+                                                :content "tool result two")))
+                   (list :role "user"
+                         :content (vector (list :type "text"
+                                                :text "user two"))))))
+      (gptel--cache-messages backend data)
+      (let ((messages (append (plist-get data :messages) nil)))
+        ;; user one, assistant one, tool_result, assistant(tool_use),
+        ;; tool_result, user two = 6 messages.
+        (should (= (length messages) 6))
+        ;; Breakpoint on the second-to-last (the tool_result before the
+        ;; incoming prompt); stale breakpoint on the first message is gone.
+        (should (gptel-anthropic-cache-test--cache-entry (nth 4 messages)))
+        (should-not (gptel-anthropic-cache-test--cache-entry (nth 0 messages)))
+        (should-not (gptel-anthropic-cache-test--cache-entry (nth 1 messages)))
+        (should-not (gptel-anthropic-cache-test--cache-entry (nth 2 messages)))
+        (should-not (gptel-anthropic-cache-test--cache-entry (nth 3 messages)))
+        ;; Incoming prompt never cached.
+        (should-not (gptel-anthropic-cache-test--cache-entry (nth 5 messages)))
+        ;; Every message is pinned to array content for a stable hash.
+        (dolist (msg messages)
+          (should (vectorp (plist-get msg :content))))))))
+
+(ert-deftest gptel-anthropic-cache-test-restamp-normalizes-string-content ()
+  "The re-stamp pins string content to arrays, like the initial parse.
+
+Messages appended between tool rounds can be plain strings in the same
+position where the initial parse would have normalized them; a flip
+between string and array representation on the wire would change the
+prompt-cache prefix hash and miss."
+  (gptel-anthropic-cache-test--with
+    (let* ((backend gptel-anthropic-cache-test-model)
+           (gptel-cache '(message))
+           (data (list :messages
+                       (vconcat
+                        (list (list :role "user" :content "user one")
+                              (list :role "assistant" :content "assistant one")
+                              (list :role "user" :content "user two"))))))
+      (gptel--cache-messages backend data)
+      (let ((messages (append (plist-get data :messages) nil)))
+        (dolist (msg messages)
+          (should (vectorp (plist-get msg :content))))
+        (should (gptel-anthropic-cache-test--cache-entry (nth 1 messages)))
+        (should-not (gptel-anthropic-cache-test--cache-entry (nth 0 messages)))
+        (should-not (gptel-anthropic-cache-test--cache-entry (nth 2 messages)))))))
+
+(ert-deftest gptel-anthropic-cache-test-restamp-respects-history-only ()
+  "Re-stamping leaves system and tools breakpoints untouched; it only
+touches messages.  (System/tools are set in `gptel--request-data' and
+never change between tool rounds.)"
+  (gptel-anthropic-cache-test--with
+    (let* ((backend gptel-anthropic-cache-test-model)
+           (data (list :messages (vconcat (list (list :role "user"
+                                                      :content "hi")))
+                       :system (vector (list :type "text" :text "sys"
+                                             :cache_control (gptel--anthropic-cache-entry)))
+                       :tools (vector (list :name "probe"
+                                            :cache_control (gptel--anthropic-cache-entry))))))
+      (gptel--cache-messages backend data)
+      ;; System/tools breakpoints survive the re-stamp.
+      (should (plist-get (aref (plist-get data :system) 0) :cache_control))
+      (should (plist-get (aref (plist-get data :tools) 0) :cache_control)))))
+
+(ert-deftest gptel-anthropic-cache-test-restamp-default-noop ()
+  "The default `gptel--cache-messages' is a no-op for backends without
+prompt caching."
+  (let ((data (list :messages [(list :role "user" :content "hi")])))
+    (should (eq (gptel--cache-messages 'some-other-backend data) data))
+    (should (equal data (list :messages [(list :role "user" :content "hi")])))))
+
+(ert-deftest gptel-anthropic-cache-test-clear-cache-control ()
+  "`gptel--anthropic-clear-cache-control' removes breakpoints from every
+content block of a message."
+  (let ((msg (list :role "user"
+                   :content (vector (list :type "text" :text "a"
+                                          :cache_control (gptel--anthropic-cache-entry))
+                                    (list :type "text" :text "b"
+                                          :cache_control (gptel--anthropic-cache-entry))))))
+    (gptel--anthropic-clear-cache-control msg)
+    (let ((content (plist-get msg :content)))
+      (should-not (plist-member (aref content 0) :cache_control))
+      (should-not (plist-member (aref content 1) :cache_control))
+      ;; Other keys are preserved.
+      (should (equal (plist-get (aref content 0) :text) "a")))))
+
+(ert-deftest gptel-anthropic-cache-test-thinking-first-message-breakpoint ()
+  "A breakpoint message whose first block is a thinking block gets the
+breakpoint on the following text block, not the thinking block.
+
+Anthropic rejects cache_control on thinking blocks
+(`invalid_request_error': \"...thinking.cache_control: Extra inputs are
+not permitted\"), so the stamp must skip block 0 and mark the first
+cacheable block instead."
+  (gptel-anthropic-cache-test--with
+    (let* ((backend gptel-anthropic-cache-test-model)
+           (gptel-cache '(message))
+           (data (list :messages
+                       (vconcat
+                        (list (list :role "user"
+                                    :content (vector
+                                              (list :type "text" :text "user one")))
+                              ;; Extended-thinking assistant turn: block 0
+                              ;; is a thinking block (as appended by the
+                              ;; stream parser), then text + tool_use.
+                              (list :role "assistant"
+                                    :content (vector
+                                              (list :type "thinking"
+                                                    :thinking "hmm..."
+                                                    :signature "sig123")
+                                              (list :type "text" :text "I'll call a tool")
+                                              (list :type "tool_use"
+                                                    :id "t1" :name "probe" :input nil)))
+                              (list :role "user"
+                                    :content (vector
+                                              (list :type "tool_result"
+                                                    :tool_use_id "t1"
+                                                    :content "result"))))))))
+      ;; The assistant turn (second-to-last, index 1) carries the
+      ;; breakpoint.
+      (gptel--cache-messages backend data)
+      (let* ((messages (append (plist-get data :messages) nil))
+             (content (plist-get (nth 1 messages) :content)))
+        (should (equal (length messages) 3))
+        ;; The thinking block itself must NOT carry cache_control...
+        (should-not (plist-member (aref content 0) :cache_control))
+        ;; ...and the breakpoint lands on the first cacheable block
+        ;; (the text block that follows the thinking block).
+        (should (equal (plist-get (aref content 1) :cache_control)
+                       '(:type "ephemeral" :ttl "5m")))
+        ;; The wire form would be exactly
+        ;;   messages[1].content = [thinking, text+cache_control, tool_use]
+        (should (equal (gptel--json-encode (nth 1 messages))
+                       (concat
+                        "{\"role\":\"assistant\",\"content\":["
+                        "{\"type\":\"thinking\",\"thinking\":\"hmm...\",\"signature\":\"sig123\"},"
+                        "{\"type\":\"text\",\"text\":\"I'll call a tool\","
+                        "\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"5m\"}},"
+                        "{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"probe\",\"input\":{}}"
+                        "]}")))))))
 
 ;;;; B. TTL
 
