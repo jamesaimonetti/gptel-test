@@ -44,6 +44,25 @@ This is a test helper that uses the production function
             results))
     (nreverse results)))
 
+;;; Test models
+
+;; Dedicated model symbols with explicit plists, so that media/MIME
+;; capability tests don't depend on production model symbols (such as
+;; gpt-4o-mini in `gptel--openai-models'), which may change or be
+;; removed at any time.
+(gptel--process-models
+ '((gptel-test-model-multimodal
+    :description "Test model with image and file input support"
+    :capabilities (media tool-use json)
+    :mime-types ("image/png" "image/jpeg" "application/pdf"))
+   (gptel-test-model-image-only
+    :description "Test model with image input support"
+    :capabilities (media)
+    :mime-types ("image/png" "image/jpeg"))
+   (gptel-test-model-text
+    :description "Test model with no media support"
+    :capabilities (tool-use json))))
+
 ;;; Buffer bounds tests
 
 (ert-deftest gptel-context-test-buffer-single-bounds ()
@@ -643,6 +662,122 @@ This is a test helper that uses the production function
       (kill-buffer buf1)
       (kill-buffer buf2)
       (delete-file test-file))))
+
+;;; Media file tests
+
+(defun gptel-context-test--make-binary-file (suffix &optional content)
+  "Create a temporary binary file with EXTENSION SUFFIX.
+CONTENT defaults to fake PNG or PDF magic bytes as appropriate."
+  (make-temp-file "gptel-context-test-" nil suffix
+                  (or content
+                      (pcase suffix
+                        ((pred (string-equal ".png"))
+                         "\x89PNG\r\n\x1a\n")
+                        ((pred (string-equal ".pdf"))
+                         "%PDF-1.4\n\x00\x00\x00fake")
+                        ((pred (string-equal ".jpg"))
+                         "\xff\xd8\xff\xdbfake")))))
+
+(ert-deftest gptel-context-test-collect-media-raw-string-files ()
+  "Test that raw string file entries in `gptel-context' become media.
+Binary files specified as bare paths (without going through
+`gptel-add-file') must be annotated with their MIME type by
+`gptel-context--collect-media' and returned as :media entries."
+  (let ((png-file (gptel-context-test--make-binary-file ".png"))
+        (pdf-file (gptel-context-test--make-binary-file ".pdf"))
+        (txt-file (make-temp-file "gptel-context-test-" nil ".txt" "text\n")))
+    (unwind-protect
+        (let* ((gptel-model 'gptel-test-model-multimodal)
+               (gptel-context (list png-file pdf-file txt-file))
+               (media (gptel-context--collect-media))
+               (paths (mapcar (lambda (entry) (plist-get entry :media)) media)))
+          ;; Binary files collected, text file not
+          (should (= (length media) 2))
+          (should (member png-file paths))
+          (should (member pdf-file paths))
+          (should-not (member txt-file paths))
+          ;; Entries have the :media form with a MIME type
+          (dolist (entry media)
+            (should (eq (car entry) :media))
+            (should (member (plist-get entry :mime)
+                            '("image/png" "application/pdf")))))
+      (delete-file png-file)
+      (delete-file pdf-file)
+      (delete-file txt-file))))
+
+(ert-deftest gptel-context-test-collect-media-mime-gate ()
+  "Test that unsupported binary files are excluded from media collection.
+A model without \"application/pdf\" in its `:mime-types' must not
+receive PDF files as media, and a model without `media' capability
+must not receive any media at all."
+  (let ((png-file (gptel-context-test--make-binary-file ".png"))
+        (pdf-file (gptel-context-test--make-binary-file ".pdf")))
+    (unwind-protect
+        (progn
+          ;; Image-only model: png kept, pdf dropped
+          (let* ((gptel-model 'gptel-test-model-image-only)
+                 (gptel-context (list png-file pdf-file))
+                 (media (gptel-context--collect-media)))
+            (should (= (length media) 1))
+            (should (equal (plist-get (car media) :media) png-file))
+            (should (equal (plist-get (car media) :mime) "image/png")))
+          ;; Text-only model: no media at all
+          (let* ((gptel-model 'gptel-test-model-text)
+                 (gptel-context (list png-file pdf-file))
+                 (media (gptel-context--collect-media)))
+            (should (null media))))
+      (delete-file png-file)
+      (delete-file pdf-file))))
+
+(ert-deftest gptel-context-test-add-file-binary-gate ()
+  "Test that `gptel-add-file' respects model MIME capabilities.
+Binary files must be added with their MIME type for models that
+declare support for it, and rejected entirely otherwise."
+  (let ((png-file (gptel-context-test--make-binary-file ".png")))
+    (unwind-protect
+        (progn
+          ;; Multimodal model: file added with :mime
+          (let ((gptel-model 'gptel-test-model-multimodal)
+                (gptel-context nil))
+            (gptel-add-file png-file)
+            (should (equal gptel-context
+                           (list (list png-file :mime "image/png")))))
+          ;; Text-only model: binary file rejected
+          (let ((gptel-model 'gptel-test-model-text)
+                (gptel-context nil))
+            (gptel-add-file png-file)
+            (should (null gptel-context))))
+      (delete-file png-file))))
+
+(ert-deftest gptel-context-test-collect-directory-expansion ()
+  "Test that directory context entries are expanded to per-file entries.
+Each contained file must appear individually in the collection, with
+binary files annotated with their MIME type, and the directory itself
+must not appear as an entry."
+  (let* ((dir (make-temp-file "gptel-context-test-dir-" t))
+         (txt-file (expand-file-name "a.txt" dir))
+         (png-file (expand-file-name "b.png" dir)))
+    (unwind-protect
+        (progn
+          (with-temp-file txt-file (insert "text file\n"))
+          (let ((coding-system-for-write 'binary))
+            (with-temp-file png-file (insert "\x89PNG\r\n\x1a\n")))
+          (let* ((gptel-model 'gptel-test-model-multimodal)
+                 (gptel-context (list dir))
+                 (collected (gptel-context--collect))
+                 (paths (mapcar #'car collected)))
+            (should (= (length collected) 2))
+            (should (member txt-file paths))
+            (should (member png-file paths))
+            (should-not (member dir paths))
+            ;; The png entry carries its MIME type
+            (let ((png-entry (assoc png-file collected)))
+              (should png-entry)
+              (should (equal (plist-get (cdr png-entry) :mime)
+                             "image/png")))))
+      (delete-file txt-file)
+      (delete-file png-file)
+      (delete-directory dir))))
 
 (provide 'gptel-context-test)
 ;;; gptel-context-test.el ends here
